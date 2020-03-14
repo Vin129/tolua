@@ -127,14 +127,19 @@ public static class ToLuaExport
         "AnimationClip.isAnimatorMotion",
         "AnimationClip.isHumanMotion",
         "AnimatorOverrideController.PerformOverrideClipListCleanup",
+        "AnimatorControllerParameter.name",
         "Caching.SetNoBackupFlag",
         "Caching.ResetNoBackupFlag",
         "Light.areaSize",
         "Light.lightmappingMode",
         "Light.lightmapBakeType",
-        "Security.GetChainOfTrustValue",
+		"Light.shadowAngle",
+		"Light.shadowRadius",
+		"Light.SetLightDirty",
+		"Security.GetChainOfTrustValue",
         "Texture2D.alphaIsTransparency",
         "WWW.movie",
+        "WWW.GetMovieTexture",
         "WebCamTexture.MarkNonReadable",
         "WebCamTexture.isReadable",
         "Graphic.OnRebuildRequested",
@@ -148,12 +153,20 @@ public static class ToLuaExport
         "MonoBehaviour.runInEditMode",
         "TextureFormat.DXT1Crunched",
         "TextureFormat.DXT5Crunched",
+        "Texture.imageContentsHash",
+        "QualitySettings.streamingMipmapsMaxLevelReduction",
+        "QualitySettings.streamingMipmapsRenderersPerFrame",		
         //NGUI
         "UIInput.ProcessEvent",
         "UIWidget.showHandlesWithMoveTool",
         "UIWidget.showHandles",
         "Input.IsJoystickPreconfigured",
-        "UIDrawCall.isActive"
+        "UIDrawCall.isActive",
+        "Dictionary.TryAdd",
+        "KeyValuePair.Deconstruct",
+        "ParticleSystem.SetJob",
+        "ParticleSystem.subEmitters", /*2019.09 ios编译出错，也可能是unity版本问题*/
+        "Type.IsSZArray"
     };
 
     class _MethodBase
@@ -287,7 +300,7 @@ public static class ToLuaExport
                 else
                 {
                     Type genericClass = typeof(LuaOut<>);
-                    Type t = genericClass.MakeGenericType(args[i].ParameterType);
+                    Type t = genericClass.MakeGenericType(args[i].ParameterType.GetElementType());
                     list.Add(t);
                 }
             }
@@ -363,7 +376,7 @@ public static class ToLuaExport
 
             for (int i = 0; i < args.Length; i++)
             {
-                ss[i] = GetTypeStr(args[i].ParameterType);
+                ss[i] = GetTypeStr(args[i].GetType());
             }
 
             if (!ToLuaExport.IsGenericMethod(method))
@@ -625,11 +638,29 @@ public static class ToLuaExport
 	public static List<MemberInfo> memberInfoFilter = new List<MemberInfo>
 	{
         //可精确查找一个函数
-		//Type.GetMethod(string name, BindingFlags bindingAttr, Binder binder, CallingConventions callConvention, Type[] types, ParameterModifier[] modifiers);
+		//Type.GetMethod(string name, BindingFlags bindingAttr, Binder binder, CallingConventions callConvention, Type[] types, ParameterModifier[] modifiers);		
     };
 
     public static bool IsMemberFilter(MemberInfo mi)
     {
+		if (type.IsGenericType)
+		{
+			Type genericType = type.GetGenericTypeDefinition();
+
+			if (genericType == typeof(Dictionary<,>) && mi.Name == "Remove")
+			{
+				MethodBase mb = (MethodBase)mi;
+				return mb.GetParameters().Length == 2;
+			}
+
+			if (genericType == typeof(Dictionary<,>) || genericType == typeof(KeyValuePair<,>))
+			{
+				string str = genericType.Name;				
+				str = str.Substring(0, str.IndexOf("`"));
+				return memberFilter.Contains(str + "." + mi.Name);
+			}			
+		}
+
 		return memberInfoFilter.Contains(mi) || memberFilter.Contains(type.Name + "." + mi.Name);
     }
 
@@ -740,16 +771,18 @@ public static class ToLuaExport
 
     public static void Generate(string dir)
     {
+#if !EXPORT_INTERFACE
         Type iterType = typeof(System.Collections.IEnumerator);
 
         if (type.IsInterface && type != iterType)
         {
             return;
         }
+#endif
 
         //Debugger.Log("Begin Generate lua Wrap for class {0}", className);        
         sb = new StringBuilder();
-        usingList.Add("System");                
+        usingList.Add("System");
 
         if (wrapClassName == "")
         {
@@ -1443,6 +1476,7 @@ public static class ToLuaExport
         if (!haveParams)
         {
             int count = paramInfos.Length + offset;
+            if (m.Name == "op_UnaryNegation") count = 2;
             sb.AppendFormat("\t\t\tToLua.CheckArgsCount(L, {0});\r\n", count);
         }
         else
@@ -1617,7 +1651,7 @@ public static class ToLuaExport
 
     static string GetPushFunction(Type t, bool isByteBuffer = false)
     {        
-        if (t.IsEnum || t.IsPrimitive || t == typeof(string) || t == typeof(LuaTable) || t == typeof(LuaCSFunction) || t == typeof(LuaThread) 
+        if (t.IsEnum || t.IsPrimitive || t == typeof(string) || t == typeof(LuaTable) || t == typeof(LuaCSFunction) || t == typeof(LuaThread) || t == typeof(LuaFunction)
             || t == typeof(Type) || t == typeof(IntPtr) || typeof(Delegate).IsAssignableFrom(t) || t == typeof(LuaByteBuffer) // || t == typeof(LuaInteger64)
             || t == typeof(Vector3) || t == typeof(Vector2) || t == typeof(Vector4) || t == typeof(Quaternion) || t == typeof(Color) || t == typeof(RaycastHit)
             || t == typeof(Ray) || t == typeof(Touch) || t == typeof(Bounds) || t == typeof(object))
@@ -1709,41 +1743,55 @@ public static class ToLuaExport
         return count;
     }
 
-    static void InitCtorList()
-    {
-        if (isStaticClass || type.IsAbstract || typeof(MonoBehaviour).IsAssignableFrom(type))
-        {
-            return;
-        }
+	static void InitCtorList()
+	{
+		if (isStaticClass || type.IsAbstract || typeof(MonoBehaviour).IsAssignableFrom(type))
+		{
+			return;
+		}
 
-        ConstructorInfo[] constructors = type.GetConstructors(BindingFlags.Instance | binding);
+		ConstructorInfo[] constructors = type.GetConstructors(BindingFlags.Instance | binding);
 
-        if (extendType != null)
-        {
-            ConstructorInfo[] ctorExtends = extendType.GetConstructors(BindingFlags.Instance | binding);
+		if (extendType != null)
+		{
+			ConstructorInfo[] ctorExtends = extendType.GetConstructors(BindingFlags.Instance | binding);
 
-            if (HasAttribute(ctorExtends[0], typeof(UseDefinedAttribute)))
-            {
-                ctorExtList.AddRange(ctorExtends);
-            }
-        }
+			if (HasAttribute(ctorExtends[0], typeof(UseDefinedAttribute)))
+			{
+				ctorExtList.AddRange(ctorExtends);
+			}
+		}
 
-        if (constructors.Length == 0)
-        {
-            return;
-        }        
+		if (constructors.Length == 0)
+		{
+			return;
+		}
 
-        for (int i = 0; i < constructors.Length; i++)
-        {                        
-            if (IsObsolete(constructors[i]))
-            {
-                continue;
-            }
+		bool isGenericType = type.IsGenericType;
+		Type genericType = isGenericType ? type.GetGenericTypeDefinition() : null;
+		Type dictType = typeof(Dictionary<,>);
 
-            int count = GetDefalutParamCount(constructors[i]);
-            int length = constructors[i].GetParameters().Length;
+		for (int i = 0; i < constructors.Length; i++)
+		{
+			if (IsObsolete(constructors[i]))
+			{
+				continue;
+			}
 
-            for (int j = 0; j < count + 1; j++)
+			int count = GetDefalutParamCount(constructors[i]);
+			int length = constructors[i].GetParameters().Length;
+
+			if (genericType == dictType && length >= 1)
+			{
+				Type pt = constructors[i].GetParameters()[0].ParameterType;
+
+				if (pt.IsGenericType && pt.GetGenericTypeDefinition() == typeof(System.Collections.Generic.IEnumerable<>))
+				{
+					continue;
+				}
+			}
+
+			for (int j = 0; j < count + 1; j++)
             {
                 _MethodBase r = new _MethodBase(constructors[i], length - j);
                 int index = ctorList.FindIndex((p) => { return CompareMethod(p, r) >= 0; });
@@ -2081,6 +2129,10 @@ public static class ToLuaExport
                 {
                     return 1;
                 }
+                else if (list1[0].ParameterType.IsPrimitive)
+                {
+                    return -1;
+                }
 
                 list1.RemoveAt(0);
             }
@@ -2089,6 +2141,10 @@ public static class ToLuaExport
                 if (list2[0].ParameterType == typeof(object))
                 {
                     return -1;
+                }
+                else if (list2[0].ParameterType.IsPrimitive)
+                {
+                    return 1;
                 }
 
                 list2.RemoveAt(0);
@@ -2103,6 +2159,14 @@ public static class ToLuaExport
                 else if (list1[i].ParameterType != typeof(object) && list2[i].ParameterType == typeof(object))
                 {
                     return -1;
+                }
+                else if (list1[i].ParameterType.IsPrimitive && !list2[i].ParameterType.IsPrimitive)
+                {
+                    return -1;
+                }
+                else if (!list1[i].ParameterType.IsPrimitive && list2[i].ParameterType.IsPrimitive)
+                {
+                    return 1;
                 }
                 else if (list1[i].ParameterType.IsPrimitive && list2[i].ParameterType.IsPrimitive)
                 {
@@ -4177,16 +4241,20 @@ public static class ToLuaExport
                     {
                         continue;
                     }
-                }
+                }                
 
                 if (IsUseDefinedAttributee(list2[i]))
                 {
-                    list.RemoveAll((md) => { return md.Name == list2[i].Name; });
+                    list.RemoveAll((md) => { return md.Name == list2[i].Name; });                    
                 }
                 else
                 {
                     int index = list.FindIndex((md) => { return IsMethodEqualExtend(md.Method, list2[i]); });
-                    if (index >= 0) list.RemoveAt(index);
+
+                    if (index >= 0)
+                    {                        
+                        list.RemoveAt(index);
+                    }
                 }
 
                 if (!IsObsolete(list2[i]))
